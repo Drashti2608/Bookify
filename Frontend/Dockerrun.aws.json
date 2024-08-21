@@ -1,0 +1,12 @@
+{
+    "AWSEBDockerrunVersion": "1",
+    "Image": {
+        "Name": "drashti268/bookify:latest",
+        "Update": "true"
+    },
+    "Ports": [
+        {
+            "ContainerPort": "3000"
+        }
+    ]
+}

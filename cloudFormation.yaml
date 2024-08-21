@@ -1,0 +1,1140 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for a comprehensive AWS environment including Cognito, DynamoDB, S3, API Gateway, Lambda functions, Step Function and EC2 for a Book Reading Application."
+
+Resources:
+  # -----------------------------------------------------#
+
+  # ----------------- Cognito Userpool ------------------#
+
+  BookifyUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: BookApplicationUsers
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+        EmailMessage: "Your verification code is {####}. "
+        EmailSubject: "Your verification code"
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+
+  BookifyUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: BookApplicationClient
+      UserPoolId: !Ref BookifyUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  # -----------------------------------------------------#
+
+  # --------------------- S3 Bucket ---------------------#
+
+  BookifyBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: my-books-bucket
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - "*"
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+            AllowedOrigins:
+              - "*"
+            ExposedHeaders:
+              - "ETag"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BookifyBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BookifyBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+            Resource: !Join
+              - ""
+              - - !GetAtt BookifyBucket.Arn
+                - "/*"
+
+  # ---------------------------------------------------#
+
+  # ----------------- DynamoDB Table ------------------#
+
+  BooksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BooksMetadata
+      AttributeDefinitions:
+        - AttributeName: book_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: book_id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # -----------------------------------------------------#
+
+  # ----------- IAM Role for Lambda Functions -----------#
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: TermProjectRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+        - arn:aws:iam::aws:policy/AmazonPollyFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AWSStepFunctionsConsoleFullAccess
+        - arn:aws:iam::aws:policy/AWSStepFunctionsFullAccess
+
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaExecutionPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  InvokeOtherLambdaFunctionsPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: InvokeOtherLambdaFunctions
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource:
+              - !GetAtt ConvertPDFtoTextFunction.Arn
+              - !GetAtt GenerateAudioFunction.Arn
+      Roles:
+        - !Ref LambdaExecutionRole
+
+  ConvertPDFtoTextFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConvertPDFtoTextFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: ConvertPdfToText.zip
+      Runtime: nodejs20.x
+      Timeout: 900 # 15 minutes
+      MemorySize: 1024
+
+  GenerateAudioFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GenerateAudioFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: GenerateAudio.zip
+      Runtime: nodejs20.x
+      Timeout: 900 # 15 minutes
+      MemorySize: 1024
+
+  # --------------------------------------------------#
+
+  # ----------------- Step Function ------------------#
+
+  BookMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: Project-State-Machine
+      DefinitionString: !Sub
+        - |
+          {
+            "StartAt": "ConvertPDFToText",
+            "States": {
+              "ConvertPDFToText": {
+                "Type": "Task",
+                "Resource": "${ConvertPDFtoTextFunction.Arn}",
+                "Next": "GenerateAudio",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 3,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.5
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "FailState"
+                  }
+                ]
+              },
+              "GenerateAudio": {
+                "Type": "Task",
+                "Resource": "${GenerateAudioFunction.Arn}",
+                "Next": "CheckAudioCompletion",
+                "Retry": [
+                  {
+                    "ErrorEquals": [
+                      "States.TaskFailed",
+                      "Insufficient time to complete"
+                    ],
+                    "IntervalSeconds": 3,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                  }
+                ],
+                "Catch": [
+                  {
+                    "ErrorEquals": [
+                      "States.ALL"
+                    ],
+                    "Next": "FailState"
+                  }
+                ]
+              },
+              "CheckAudioCompletion": {
+                "Type": "Choice",
+                "Choices": [
+                  {
+                    "Variable": "$.audioKey",
+                    "IsPresent": true,
+                    "Next": "SuccessState"
+                  }
+                ],
+                "Default": "GenerateAudio"
+              },
+              "SuccessState": {
+                "Type": "Succeed"
+              },
+              "FailState": {
+                "Type": "Fail",
+                "Cause": "Audio generation failed"
+              }
+            }
+          }
+        - {}
+      RoleArn: !GetAtt LambdaExecutionRole.Arn
+
+  # -----------------------------------------------------#
+
+  # ----------------- Lambda Functions ------------------#
+
+  AddBookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: AddBookFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: AddBook.zip
+      Runtime: nodejs20.x
+
+  InitiateProcessFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: InitiateProcessFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: InitiateProcess.zip
+      Runtime: nodejs20.x
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Ref BookMachine
+
+  GetAudioURLFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAudioURLFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: GetAudioURL.zip
+      Runtime: nodejs20.x
+
+  GetAllBooksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAllBooksFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: GetAllBooks.zip
+      Runtime: nodejs20.x
+
+  GetMyBooksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetMyBooksFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: MyBooks.zip
+      Runtime: nodejs20.x
+
+  LikeBookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: LikeBookFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: LikeBook.zip
+      Runtime: nodejs20.x
+
+  GetLikesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetLikesFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: GetLikes.zip
+      Runtime: nodejs20.x
+
+  GetFavouriteBooksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetFavouriteBooksFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: GetFavouriteBooks.zip
+      Runtime: nodejs20.x
+
+  DeleteBookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DeleteBookFunction1
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: lambdacodebucket1
+        S3Key: DeleteBook.zip
+      Runtime: nodejs20.x
+
+  # -----------------------------------------------------#
+
+  # ---------------- Lambda Permissions -----------------#
+
+  LambdaPermissionAddBookFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt AddBookFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGetAllBookFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetAllBooksFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionInitiateProcessFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt InitiateProcessFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionConvertPDFtoTextFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ConvertPDFtoTextFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGenerateAudioFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GenerateAudioFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGetAudioURLFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetAudioURLFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGetMyBooksFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetMyBooksFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionLikeBookFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LikeBookFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGetLikesFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetLikesFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionGetFavouriteBooksFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt GetFavouriteBooksFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  LambdaPermissionDeleteBookFunction:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt DeleteBookFunction.Arn
+      Principal: apigateway.amazonaws.com
+
+  # -----------------------------------------------------#
+
+  # -------------------- ApiGateway ---------------------#
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: BookifyAPI
+      Description: API Gateway for my Book reading Application
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiGatewayAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: ApiGatewayAuthorizer
+      RestApiId: !Ref ApiGateway
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt BookifyUserPool.Arn
+
+  # 1. /books Resource
+  ApiGatewayBooksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "books"
+      RestApiId: !Ref ApiGateway
+
+  # 2. /generateAudio Resource
+  ApiGatewayGenerateAudioResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "generateAudio"
+      RestApiId: !Ref ApiGateway
+
+  # 3. /booklikes Resource
+  ApiGatewayBookLikesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "booklikes"
+      RestApiId: !Ref ApiGateway
+
+  # 4. /favouritebooks Resource
+  ApiGatewayFavouriteBooksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "favouritebooks"
+      RestApiId: !Ref ApiGateway
+
+  # 5. /getAudioUrl Resource
+  ApiGatewayGetAudioURLResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "getAudioUrl"
+      RestApiId: !Ref ApiGateway
+
+  # 6. /mybooks Resource
+  ApiGatewayGetMyBooksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "mybooks"
+      RestApiId: !Ref ApiGateway
+
+  # 7. /deletebooks Resource
+  ApiGatewayDeleteBookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "deletebook"
+      RestApiId: !Ref ApiGateway
+
+  # 8. /likebook Resource
+  ApiGatewayLikeBookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "likebook"
+      RestApiId: !Ref ApiGateway
+
+  # /books Options Method
+  ApiGatewayBooksOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /generateAudio Options Method
+  ApiGatewayGenerateAudioOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayGenerateAudioResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /booklikes Options Method
+  ApiGatewayBookLikesOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayBookLikesResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /favouritebooks Options Method
+  ApiGatewayFavouriteBooksOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayFavouriteBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /getAudioUrl Options Method
+  ApiGatewayGetAudioURLOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayGetAudioURLResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /mybooks Options Method
+  ApiGatewayGetMyBooksOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayGetMyBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /deletebooks Options Method
+  ApiGatewayDeleteBookOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayDeleteBookResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /likebook Options Method
+  ApiGatewayLikeBookOptions:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref ApiGatewayLikeBookResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # /books Post Method
+  ApiGatewayAddBookMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AddBookFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: AddBookFunction
+
+  # /books Get Method
+  ApiGatewayGetBooksMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAllBooksFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: GetAllBooksFunction
+
+  # /books Options Method
+  ApiGatewayGenerateAudioMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayGenerateAudioResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InitiateProcessFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: InitiateProcessFunction
+
+  # /booklikes Get Method
+  ApiGatewayGetBooksLikesMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayBookLikesResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetLikesFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: GetLikesFunction
+
+  # /favouritebooks Get Method
+  ApiGatewayGetFavouriteBooksMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayFavouriteBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetFavouriteBooksFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      RequestParameters:
+        method.request.querystring.email: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: GetFavouriteBooksFunction
+
+  # /getAudioUrl Get Method
+  ApiGatewayGetAudioURLMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayGetAudioURLResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAudioURLFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: GetAudioURLFunction
+
+  # /mybooks Get Method
+  ApiGatewayGetMyBooksMethodGet:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: GET
+      ResourceId: !Ref ApiGatewayGetMyBooksResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetMyBooksFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      RequestParameters:
+        method.request.querystring.email: true
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: GetMyBooksFunction
+
+  # /deletebooks Delete Method
+  ApiGatewayDeleteBookMethodDelete:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: DELETE
+      ResourceId: !Ref ApiGatewayDeleteBookResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteBookFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: DeleteBookFunction
+
+  # /likebook Post Method
+  ApiGatewayLikeBookMethodPost:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiGatewayAuthorizer
+      HttpMethod: POST
+      ResourceId: !Ref ApiGatewayLikeBookResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LikeBookFunction.Arn}/invocations"
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: $input.json('$')
+      RequestModels:
+        application/json: Empty
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: "Empty"
+    DependsOn: LikeBookFunction
+
+  # ---------------------------------------------------------------#
+
+  # -------------------- ApiGateway Deployment---------------------#
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: prod
+    DependsOn:
+      - ApiGatewayAddBookMethodPost
+      - ApiGatewayGetBooksMethodGet
+      - ApiGatewayGenerateAudioMethodPost
+      - ApiGatewayGetBooksLikesMethodGet
+      - ApiGatewayGetFavouriteBooksMethodGet
+      - ApiGatewayGetAudioURLMethodGet
+      - ApiGatewayGetMyBooksMethodGet
+      - ApiGatewayDeleteBookMethodDelete
+      - ApiGatewayLikeBookMethodPost
+
+  # ----------------------------------------------#
+
+  # -------------------- EC2 ---------------------#
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0ae8f15ae66fe8cda
+      InstanceType: t2.micro
+      KeyName: cloudkey
+      SecurityGroups:
+        - Ref: BookifySecurityGroup
+      Tags:
+        - Key: Name
+          Value: Bookify
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum update -y
+          sudo yum install -y docker
+          sudo service docker start
+          sudo chkconfig docker on
+
+          sudo docker pull drashti268/bookify:latest
+          sudo docker stop bookify-app
+          sudo docker rm bookify-app
+          rm -f .env
+
+          echo "REACT_APP_API_BASE_URL=https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod" >> .env
+          echo "REACT_APP_COGNITO_USER_POOL_ID=${BookifyUserPool}" >> .env
+          echo "REACT_APP_COGNITO_CLIENT_ID=${BookifyUserPoolClient}" >> .env
+
+          sudo docker run --name bookify-app -d -p 80:3000 --env-file .env drashti268/bookify:latest
+
+  BookifySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow SSH and port 3000 access from anywhere
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  # --------------------------------------------------#
+
+  # -------------------- Outputs ---------------------#
+
+Outputs:
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref BookifyUserPool
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref BookifyUserPoolClient
+
+  StepFunctionArn:
+    Description: "The ARN of the Step Function"
+    Value: !GetAtt BookMachine.Arn
+
+  ConvertPDFtoTextFunctionArn:
+    Description: ARN of the ConvertPDFtoText Function
+    Value: !GetAtt ConvertPDFtoTextFunction.Arn
+
+  GenerateAudioFunctionArn:
+    Description: ARN of the GenerateAudio Function
+    Value: !GetAtt GenerateAudioFunction.Arn
+
+  ApiUrl:
+    Description: "API Gateway URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+  EC2InstancePublicIp:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+
+  # ---------------------- End -----------------------#

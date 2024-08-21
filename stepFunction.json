@@ -1,0 +1,70 @@
+{
+    "StartAt": "ConvertPDFToText",
+    "States": {
+        "ConvertPDFToText": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:010928192313:function:ConvertPDFtoTextFunction",
+            "Next": "GenerateAudio",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "States.TaskFailed"
+                    ],
+                    "IntervalSeconds": 3,
+                    "MaxAttempts": 2,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "Next": "FailState"
+                }
+            ]
+        },
+        "GenerateAudio": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:us-east-1:010928192313:function:GenerateAudioFunction",
+            "Next": "CheckAudioCompletion",
+            "Retry": [
+                {
+                    "ErrorEquals": [
+                        "States.TaskFailed",
+                        "Insufficient time to complete"
+                    ],
+                    "IntervalSeconds": 3,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 1.5
+                }
+            ],
+            "Catch": [
+                {
+                    "ErrorEquals": [
+                        "States.ALL"
+                    ],
+                    "Next": "FailState"
+                }
+            ]
+        },
+        "CheckAudioCompletion": {
+            "Type": "Choice",
+            "Choices": [
+                {
+                    "Variable": "$.audioKey",
+                    "IsPresent": true,
+                    "Next": "SuccessState"
+                }
+            ],
+            "Default": "GenerateAudio"
+        },
+        "SuccessState": {
+            "Type": "Succeed"
+        },
+        "FailState": {
+            "Type": "Fail",
+            "Cause": "Audio generation failed"
+        }
+    }
+}
