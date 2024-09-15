@@ -22,3 +22,10 @@ Bookify is a sophisticated platform that revolutionizes digital book management 
 
 Bookify combines modern web technologies with robust cloud services, creating a comprehensive solution for book enthusiasts and audio content consumers. 
 
+## System Architecture
+
+![Bookify System Architecture](./Architecture.png)
+
+## Process Workflow design
+
+![Step Function Design](./stepFunction.png)
